@@ -78,6 +78,12 @@ textarea.in{height:auto;padding:10px 12px;font-family:var(--mono);font-size:12px
 .addrow{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
 .addrow label{flex:1 1 160px}
 footer{text-align:center;font-size:13px;color:var(--muted)}
+.sync{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:14px;color:var(--muted)}
+.dot{width:10px;height:10px;border-radius:50%;background:#9A9AA8;flex-shrink:0}
+.dot.ok{background:#1F8A5B}.dot.busy{background:var(--accent)}.dot.bad{background:var(--owe)}
+.pin{max-width:420px;margin:40px auto 0}
+.filebtn{position:relative;overflow:hidden;display:inline-flex;align-items:center;justify-content:center}
+.filebtn input{position:absolute;inset:0;opacity:0;cursor:pointer}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -87,22 +93,32 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
 <script>
 (function () {
   'use strict';
-  var KEY = 'split-v1';
+
+  // ===== Paste your Google Apps Script Web app URL between the quotes. =====
+  // Leave it empty to keep everything on this device only.
+  var SCRIPT_URL = '';
+  // ==========================================================================
+
+  var REMOTE = !!SCRIPT_URL;
+  var K = { local: 'split-v1', snap: 'split-v2-snap', queue: 'split-v2-queue', admin: 'split-v2-admin', merged: 'split-v2-merged' };
   var app = document.getElementById('app');
 
-  function today() {
-    var d = new Date();
-    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  }
-  function daysAgo(n) {
-    var d = new Date(Date.now() - n * 86400000);
-    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  }
+  function lsGet(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function ymd(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+  function today() { return ymd(new Date()); }
+  function daysAgo(n) { return ymd(new Date(Date.now() - n * 86400000)); }
+  function uid(p) { return p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
   function esc(v) {
     return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
   function inr(n) { return '₹' + Math.round(Math.abs(n)).toLocaleString('en-IN'); }
   function validUpi(u) { return /^[A-Za-z0-9._-]{2,256}@[A-Za-z][A-Za-z0-9]{1,63}$/.test(u || ''); }
+  function isAdmin() { return !REMOTE || !!S.admin; }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
   function sampleData() {
     var all = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
@@ -121,6 +137,39 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
       sample: true
     };
   }
+
+  // ---------- data: last saved copy + changes waiting to upload ----------
+  // snap  = the team sheet as last seen (or this device's data when not connected)
+  // queue = changes made here that the sheet hasn't confirmed yet
+  var snap, queue = [];
+  if (REMOTE) {
+    snap = lsGet(K.snap, { people: [], bills: [] });
+    queue = lsGet(K.queue, []);
+  } else {
+    var loc = lsGet(K.local, null);
+    snap = loc && Array.isArray(loc.people) && Array.isArray(loc.bills) ? loc : sampleData();
+  }
+
+  function applyOp(d, o) {
+    if (o.op === 'addBill') { if (!d.bills.some(function (b) { return b.id === o.bill.id; })) d.bills.push(o.bill); }
+    else if (o.op === 'deleteBill') d.bills = d.bills.filter(function (b) { return b.id !== o.id; });
+    else if (o.op === 'upsertPerson') {
+      var i = d.people.findIndex(function (p) { return p.id === o.person.id; });
+      if (i >= 0) d.people[i] = o.person; else d.people.push(o.person);
+    }
+    else if (o.op === 'removePerson') d.people = d.people.filter(function (p) { return p.id !== o.id; });
+    else if (o.op === 'import') { d.people = clone(o.people); d.bills = clone(o.bills); }
+    return d;
+  }
+  function data() { return queue.reduce(applyOp, clone({ people: snap.people, bills: snap.bills })); }
+
+  var S = {
+    admin: REMOTE ? lsGet(K.admin, '') : '', adminDraft: '', adminMsg: '', adminOpen: false,
+    status: REMOTE ? 'connecting' : 'local', lastSync: 0, busy: false,
+    form: null, error: '', newName: '', newUpi: '', teamMsg: '', backupMsg: '', upiDraft: {}
+  };
+  S.form = blankForm(data().people);
+
   function blankForm(people, keep) {
     return {
       kind: keep ? keep.kind : 'meal', title: '', bday: '', amt: '',
@@ -130,46 +179,120 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     };
   }
 
-  var data = sampleData();
-  try {
-    var raw = localStorage.getItem(KEY);
-    if (raw) {
-      var d = JSON.parse(raw);
-      if (d && Array.isArray(d.people) && Array.isArray(d.bills)) data = { people: d.people, bills: d.bills, sample: !!d.sample };
+  function set(patch) { for (var k in patch) S[k] = patch[k]; render(); }
+  function setForm(k, v) { var f = Object.assign({}, S.form); f[k] = v; set({ form: f, error: '' }); }
+
+  function doOp(o, extra) {
+    if (REMOTE) {
+      queue.push(o); lsSet(K.queue, queue);
+      set(extra || {});
+      flush();
+    } else {
+      snap = applyOp(clone(snap), o);
+      if (o.op !== 'import' || !snap.sample) snap.sample = false;
+      lsSet(K.local, snap);
+      set(extra || {});
     }
-  } catch (e) {}
-
-  var S = {
-    people: data.people, bills: data.bills, sample: data.sample,
-    form: blankForm(data.people), error: '',
-    newName: '', newUpi: '', teamMsg: '', backupText: '', backupMsg: ''
-  };
-  var plan = [];
-
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify({ people: S.people, bills: S.bills, sample: S.sample })); } catch (e) {}
-  }
-  function set(patch, persist) {
-    for (var k in patch) S[k] = patch[k];
-    if (persist) save();
-    render();
-  }
-  function setForm(k, v) {
-    var f = Object.assign({}, S.form); f[k] = v;
-    set({ form: f, error: '' });
   }
 
-  function person(id) { return S.people.find(function (p) { return p.id === id; }); }
+  // ---------- talking to the team sheet ----------
+  function post(body) {
+    return fetch(SCRIPT_URL, {
+      method: 'POST', redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); });
+  }
+  function got(res) {
+    if (!res || !res.ok) {
+      throw new Error(res && res.error || 'failed');
+    }
+    snap = { people: res.people || [], bills: res.bills || [] };
+    lsSet(K.snap, snap);
+    S.lastSync = Date.now();
+    // First load on a new phone: fill the form once the team list arrives.
+    if (!S.form.payer && !S.form.members.length) S.form = blankForm(data().people, S.form);
+  }
+  function flush() {
+    if (!REMOTE || S.busy) return;
+    if (!queue.length) return refresh();
+    S.busy = true; S.status = 'saving'; render();
+    post(queue[0]).then(function (res) {
+      got(res);
+      queue.shift(); lsSet(K.queue, queue);
+      S.busy = false; S.status = 'ok';
+      if (queue.length) flush(); else render();
+    }).catch(function (err) {
+      S.busy = false;
+      if (err && err.message === 'admin') {
+        // Only the admin can change team details: drop that change and sign out of admin.
+        queue.shift(); lsSet(K.queue, queue);
+        lsDel(K.admin); S.admin = '';
+        S.teamMsg = 'Only the admin can change team details. Enter the admin PIN again.';
+        S.status = 'ok';
+        if (queue.length) flush(); else refresh();
+        return;
+      }
+      S.status = 'offline'; render();
+    });
+  }
+  function refresh() {
+    if (!REMOTE || S.busy) return;
+    if (queue.length) return flush();
+    S.busy = true; if (!S.lastSync) S.status = 'connecting'; render();
+    fetch(SCRIPT_URL + '?action=list', { redirect: 'follow' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        got(res);
+        S.busy = false; S.status = 'ok';
+        if (S.admin && !lsGet(K.merged, false)) mergeOldData(); else render();
+      })
+      .catch(function () { S.busy = false; S.status = 'offline'; render(); });
+  }
+
+  // First time on a device that already has bills from before the sheet existed:
+  // upload anything the sheet doesn't have, matching people by name.
+  function mergeOldData() {
+    lsSet(K.merged, true);
+    var old = lsGet(K.local, null);
+    if (!old || old.sample || !Array.isArray(old.people)) { render(); return; }
+    var map = {}, ops = [];
+    old.people.forEach(function (p) {
+      var m = snap.people.find(function (x) { return x.name.trim().toLowerCase() === p.name.trim().toLowerCase(); });
+      if (m) {
+        map[p.id] = m.id;
+        if (!m.upi && p.upi) ops.push({ op: 'upsertPerson', person: Object.assign({}, m, { upi: p.upi }), adminPin: S.admin });
+      } else {
+        map[p.id] = p.id;
+        ops.push({ op: 'upsertPerson', person: { id: p.id, name: p.name, upi: p.upi || '' }, adminPin: S.admin });
+      }
+    });
+    var have = {};
+    snap.bills.forEach(function (b) { have[b.id] = true; });
+    var r = function (id) { return map[id] || id; };
+    (old.bills || []).forEach(function (b) {
+      if (have[b.id]) return;
+      var nb = Object.assign({}, b, { payer: r(b.payer), members: (b.members || []).map(r) });
+      if (b.bday) nb.bday = r(b.bday);
+      if (b.to) nb.to = r(b.to);
+      ops.push({ op: 'addBill', bill: nb });
+    });
+    if (ops.length) { queue = queue.concat(ops); lsSet(K.queue, queue); flush(); }
+    else render();
+  }
+
+  // ---------- money maths ----------
+  var D = data(), plan = [];
+  function person(id) { return D.people.find(function (p) { return p.id === id; }); }
   function name(id) { var p = person(id); return p ? p.name : 'Removed'; }
   function sharers(b) {
     return (b.members || []).filter(function (m) { return !(b.kind === 'birthday' && b.bday && m === b.bday); });
   }
-
   function ledger() {
     var bal = {}, paid = {}, share = {};
-    S.people.forEach(function (p) { bal[p.id] = 0; paid[p.id] = 0; share[p.id] = 0; });
+    D.people.forEach(function (p) { bal[p.id] = 0; paid[p.id] = 0; share[p.id] = 0; });
     function add(o, k, v) { if (o[k] === undefined) o[k] = 0; o[k] += v; }
-    S.bills.forEach(function (b) {
+    D.bills.forEach(function (b) {
       var amt = Number(b.amt) || 0;
       if (b.kind === 'settle') { add(bal, b.payer, amt); add(bal, b.to, -amt); return; }
       var sh = sharers(b); if (!sh.length) return;
@@ -179,7 +302,6 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     });
     return { bal: bal, paid: paid, share: share };
   }
-
   function settlePlan(bal) {
     var debt = [], cred = [];
     Object.keys(bal).forEach(function (k) {
@@ -198,9 +320,31 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     }
     return out;
   }
-
   function payUrl(p, amt) {
     return 'upi://pay?pa=' + p.upi + '&pn=' + encodeURIComponent(p.name) + '&am=' + Math.round(amt) + '.00&cu=INR&tn=' + encodeURIComponent('Team bill split');
+  }
+
+  // ---------- backup files ----------
+  function downloadBackup() {
+    if (!isAdmin()) return;
+    var d = data();
+    var blob = new Blob([JSON.stringify({ app: 'team-bill-splitter', saved: new Date().toISOString(), people: d.people, bills: d.bills }, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bill-splitter-backup-' + today() + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+    set({ backupMsg: 'Backup file downloaded. Keep it in Google Drive or email it to yourself.' });
+  }
+  function restoreFrom(text) {
+    if (!isAdmin()) return set({ backupMsg: 'Only the admin can restore a backup.' });
+    var d;
+    try { d = JSON.parse(text); } catch (e) { return set({ backupMsg: 'That file isn’t a Bill Splitter backup.' }); }
+    if (!d || !Array.isArray(d.people) || !Array.isArray(d.bills)) return set({ backupMsg: 'That file isn’t a Bill Splitter backup.' });
+    var msg = REMOTE ? 'Replace the whole team sheet with this backup (' + d.people.length + ' people, ' + d.bills.length + ' bills)? Everyone will see the change.'
+      : 'Replace everything on this device with this backup?';
+    if (!confirm(msg)) return;
+    doOp({ op: 'import', people: d.people, bills: d.bills, adminPin: S.admin }, { backupMsg: 'Restored ' + d.people.length + ' people and ' + d.bills.length + ' bills.', form: blankForm(d.people) });
   }
 
   // ---------- actions ----------
@@ -212,67 +356,75 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
       if (i >= 0) m.splice(i, 1); else m.push(id);
       setForm('members', m);
     },
-    all: function () { setForm('members', S.people.map(function (p) { return p.id; })); },
+    all: function () { setForm('members', D.people.map(function (p) { return p.id; })); },
     none: function () { setForm('members', []); },
     addBill: function () {
       var f = S.form, amt = Number(String(f.amt).replace(/,/g, ''));
       if (!f.title.trim()) return set({ error: f.kind === 'meal' ? 'Add the place you ate at.' : 'Add what the bill was for.' });
       if (!(amt > 0)) return set({ error: 'Enter the total bill amount.' });
-      if (!f.payer) return set({ error: 'Pick who paid.' });
+      if (!f.payer || !person(f.payer)) return set({ error: 'Pick who paid.' });
       if (f.kind === 'birthday' && !f.bday) return set({ error: 'Pick whose birthday it was.' });
-      var b = { id: 'b' + Date.now(), kind: f.kind, title: f.title.trim(), date: f.date || today(), amt: amt, payer: f.payer, members: f.members.slice() };
+      var b = { id: uid('b'), kind: f.kind, title: f.title.trim(), date: f.date || today(), amt: amt, payer: f.payer, members: f.members.filter(function (m) { return person(m); }) };
       if (f.kind === 'birthday') b.bday = f.bday;
       if (!sharers(b).length) return set({ error: 'Select at least one person to split with.' });
-      set({ bills: S.bills.concat([b]), form: blankForm(S.people, f), error: '' }, true);
+      doOp({ op: 'addBill', bill: b }, { form: blankForm(D.people, f), error: '' });
     },
     mark: function (i) {
       var x = plan[Number(i)]; if (!x) return;
-      set({ bills: S.bills.concat([{ id: 'b' + Date.now(), kind: 'settle', title: 'Settled up', date: today(), amt: x.amt, payer: x.from, to: x.to, members: [] }]) }, true);
+      if (!confirm('Record that ' + name(x.from) + ' paid ' + name(x.to) + ' ' + inr(x.amt) + '?')) return;
+      doOp({ op: 'addBill', bill: { id: uid('s'), kind: 'settle', title: 'Settled up', date: today(), amt: x.amt, payer: x.from, to: x.to, members: [] } });
     },
     del: function (id) {
-      var b = S.bills.find(function (x) { return x.id === id; });
-      if (b && !confirm('Delete “' + (b.kind === 'settle' ? 'this payment' : b.title) + '”?')) return;
-      set({ bills: S.bills.filter(function (x) { return x.id !== id; }) }, true);
+      var b = D.bills.find(function (x) { return x.id === id; });
+      if (!b || !confirm('Delete “' + (b.kind === 'settle' ? 'this payment' : b.title) + '”? This removes it for everyone.')) return;
+      doOp({ op: 'deleteBill', id: id });
     },
     addPerson: function () {
+      if (!isAdmin()) return;
       var n = S.newName.trim(), u = S.newUpi.trim();
       if (!n) return set({ teamMsg: 'Type a name first.' });
-      if (S.people.some(function (p) { return p.name.toLowerCase() === n.toLowerCase(); })) return set({ teamMsg: n + ' is already on the team.' });
+      if (D.people.some(function (p) { return p.name.toLowerCase() === n.toLowerCase(); })) return set({ teamMsg: n + ' is already on the team.' });
       if (u && !validUpi(u)) return set({ teamMsg: 'That UPI ID doesn’t look right. It should look like name@okaxis.' });
-      var p = { id: 'p' + Date.now(), name: n, upi: u };
+      var p = { id: uid('p'), name: n, upi: u };
       var f = Object.assign({}, S.form, { members: S.form.members.concat([p.id]) });
       if (!f.payer) f.payer = p.id;
-      set({ people: S.people.concat([p]), newName: '', newUpi: '', teamMsg: '', form: f }, true);
+      doOp({ op: 'upsertPerson', person: p, adminPin: S.admin }, { newName: '', newUpi: '', teamMsg: '', form: f });
     },
     remove: function (id) {
-      var used = S.bills.some(function (b) { return b.payer === id || b.to === id || b.bday === id || (b.members || []).indexOf(id) >= 0; });
+      if (!isAdmin()) return;
+      var used = D.bills.some(function (b) { return b.payer === id || b.to === id || b.bday === id || (b.members || []).indexOf(id) >= 0; });
       if (used) return set({ teamMsg: name(id) + ' is part of saved bills, so they can’t be removed. Delete those bills first.' });
-      var people = S.people.filter(function (p) { return p.id !== id; });
+      if (!confirm('Remove ' + name(id) + ' from the team?')) return;
       var f = Object.assign({}, S.form, { members: S.form.members.filter(function (m) { return m !== id; }) });
-      if (f.payer === id) f.payer = people.length ? people[0].id : '';
-      set({ people: people, form: f, teamMsg: '' }, true);
+      if (f.payer === id) f.payer = '';
+      doOp({ op: 'removePerson', id: id, adminPin: S.admin }, { form: f, teamMsg: '' });
     },
     clearSample: function () {
       if (!confirm('Remove the sample names and bills?')) return;
-      set({ people: [], bills: [], sample: false, form: blankForm([]) }, true);
+      snap = { people: [], bills: [], sample: false }; lsSet(K.local, snap);
+      set({ form: blankForm([]) });
     },
-    showBackup: function () {
-      set({ backupText: JSON.stringify({ people: S.people, bills: S.bills }), backupMsg: 'Backup ready. Copy it and keep it somewhere safe.' });
+    download: downloadBackup,
+    refresh: function () { refresh(); },
+    openAdmin: function () { set({ adminOpen: true, adminMsg: '' }); },
+    closeAdmin: function () { set({ adminOpen: false, adminDraft: '', adminMsg: '' }); },
+    unlockAdmin: function () {
+      var p = S.adminDraft.trim();
+      if (!p) return set({ adminMsg: 'Enter the admin PIN.' });
+      set({ adminMsg: 'Checking…' });
+      fetch(SCRIPT_URL, { method: 'POST', redirect: 'follow', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ op: 'checkAdmin', adminPin: p }) })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (!res || !res.ok) return set({ adminMsg: 'That PIN isn’t right.' });
+          lsSet(K.admin, p);
+          S.admin = p; S.adminOpen = false; S.adminDraft = ''; S.adminMsg = ''; S.teamMsg = '';
+          if (!lsGet(K.merged, false)) mergeOldData(); else render();
+        })
+        .catch(function () { set({ adminMsg: 'Can’t reach the team sheet. Check your internet and try again.' }); });
     },
-    copyBackup: function () {
-      var t = S.backupText || JSON.stringify({ people: S.people, bills: S.bills });
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(t).then(function () { set({ backupText: t, backupMsg: 'Copied. Paste it into a chat or note to keep it.' }); },
-          function () { set({ backupText: t, backupMsg: 'Couldn’t copy automatically. Select the text below and copy it.' }); });
-      } else set({ backupText: t, backupMsg: 'Select the text below and copy it.' });
-    },
-    restore: function () {
-      try {
-        var d = JSON.parse(S.backupText);
-        if (!d || !Array.isArray(d.people) || !Array.isArray(d.bills)) throw new Error('bad');
-        if (!confirm('Replace everything here with the pasted backup?')) return;
-        set({ people: d.people, bills: d.bills, sample: false, form: blankForm(d.people), backupMsg: 'Restored ' + d.people.length + ' people and ' + d.bills.length + ' bills.' }, true);
-      } catch (e) { set({ backupMsg: 'That text isn’t a valid backup. Paste the whole thing.' }); }
+    lockAdmin: function () {
+      lsDel(K.admin);
+      set({ admin: '', upiDraft: {}, teamMsg: '' });
     }
   };
 
@@ -283,11 +435,16 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     bday: function (v) { setForm('bday', v); },
     newName: function (v) { set({ newName: v, teamMsg: '' }); },
     newUpi: function (v) { set({ newUpi: v, teamMsg: '' }); },
-    backup: function (v) { set({ backupText: v, backupMsg: '' }); },
-    upi: function (v, id) {
-      set({ people: S.people.map(function (p) { return p.id === id ? Object.assign({}, p, { upi: v.trim() }) : p; }) }, true);
-    }
+    adminPin: function (v) { set({ adminDraft: v, adminMsg: '' }); },
+    upi: function (v, id) { var d = Object.assign({}, S.upiDraft); d[id] = v; set({ upiDraft: d }); }
   };
+  function commitUpi(id) {
+    if (!(id in S.upiDraft) || !isAdmin()) return;
+    var v = S.upiDraft[id].trim(), p = person(id);
+    var d = Object.assign({}, S.upiDraft); delete d[id];
+    if (!p || (p.upi || '') === v) return set({ upiDraft: d });
+    doOp({ op: 'upsertPerson', person: Object.assign({}, p, { upi: v }), adminPin: S.admin }, { upiDraft: d });
+  }
 
   app.addEventListener('click', function (e) {
     var el = e.target.closest('[data-act]');
@@ -300,10 +457,22 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     var el = e.target, b = el.getAttribute && el.getAttribute('data-bind');
     if (b && binds[b]) binds[b](el.value, el.getAttribute('data-arg'));
   });
-  app.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && e.target.getAttribute && e.target.getAttribute('data-bind') === 'newName' || (e.key === 'Enter' && e.target.getAttribute && e.target.getAttribute('data-bind') === 'newUpi')) {
-      e.preventDefault(); actions.addPerson();
+  app.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el.getAttribute('data-bind') === 'upi') commitUpi(el.getAttribute('data-arg'));
+    if (el.getAttribute('data-file') === 'restore' && el.files && el.files[0]) {
+      var r = new FileReader();
+      r.onload = function () { restoreFrom(String(r.result)); };
+      r.readAsText(el.files[0]);
+      el.value = '';
     }
+  });
+  app.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' || !e.target.getAttribute) return;
+    var b = e.target.getAttribute('data-bind');
+    if (b === 'newName' || b === 'newUpi') { e.preventDefault(); actions.addPerson(); }
+    if (b === 'adminPin') { e.preventDefault(); actions.unlockAdmin(); }
+    if (b === 'upi') { e.preventDefault(); e.target.blur(); }
   });
 
   // ---------- view ----------
@@ -311,19 +480,30 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
   var ICON_X = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg>';
   var TAGS = { meal: ['Meal out', '#E7F3EF', '#0B5A40'], birthday: ['Birthday', '#FCE8F1', '#8A1C4A'], other: ['Other', '#EEEEF3', '#3D3D4E'], settle: ['Payment', '#EEF0FF', '#312E81'] };
 
+  function syncView() {
+    if (!REMOTE) return '<div class="sync"><span class="dot"></span><span>Saved on this device only</span></div>';
+    var dot = 'busy', text = 'Connecting to the team sheet…';
+    if (S.status === 'saving') text = 'Saving ' + queue.length + (queue.length === 1 ? ' change…' : ' changes…');
+    else if (S.status === 'offline') { dot = 'bad'; text = queue.length ? queue.length + (queue.length === 1 ? ' change' : ' changes') + ' waiting to upload. Check your internet.' : 'Can’t reach the team sheet. Showing the last saved copy.'; }
+    else if (S.status === 'ok') { dot = 'ok'; text = 'Saved to the team sheet'; }
+    return '<div class="sync" role="status"><span class="dot ' + dot + '"></span><span>' + esc(text) + '</span>' +
+      '<button class="btn sm" data-act="refresh"' + (S.busy ? ' disabled' : '') + '>Refresh</button></div>';
+  }
+
   function view() {
+    D = data();
     var f = S.form, L = ledger();
     plan = settlePlan(L.bal);
-    var total = S.bills.reduce(function (a, b) { return a + (b.kind === 'settle' ? 0 : Number(b.amt) || 0); }, 0);
+    var total = D.bills.reduce(function (a, b) { return a + (b.kind === 'settle' ? 0 : Number(b.amt) || 0); }, 0);
     var open = Object.keys(L.bal).reduce(function (a, k) { return a + (L.bal[k] > 0 ? L.bal[k] : 0); }, 0);
     var h = '';
 
-    h += '<header class="head"><div style="display:flex;flex-direction:column;gap:4px">' +
-      '<p class="kicker">Team expenses</p><h1>Bill Splitter</h1><p class="muted">Who paid, who came, who owes whom.</p></div>' +
+    h += '<header class="head"><div style="display:flex;flex-direction:column;gap:6px">' +
+      '<p class="kicker">Team expenses</p><h1>Bill Splitter</h1>' + syncView() + '</div>' +
       '<div class="stats"><div class="stat"><span class="small muted">Spent together</span><b>' + inr(total) + '</b></div>' +
       '<div class="stat"><span class="small muted">Still to settle</span><b style="color:var(--owe)">' + inr(open) + '</b></div></div></header>';
 
-    if (S.sample) {
+    if (!REMOTE && snap.sample) {
       h += '<div class="banner"><span>These are sample names and bills. Clear them, then add your team’s names under Team.</span>' +
         '<button class="btn dark" data-act="clearSample">Clear sample data</button></div>';
     }
@@ -333,7 +513,8 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     var titleLabel = f.kind === 'meal' ? 'Where did you eat?' : f.kind === 'birthday' ? 'What was bought?' : 'What was it for?';
     var titleHint = f.kind === 'meal' ? 'Restaurant or place' : f.kind === 'birthday' ? 'Cake, decorations, gift…' : 'Cab, snacks, team outing…';
     var whoLabel = f.kind === 'birthday' ? 'Who was at the celebration?' : f.kind === 'meal' ? 'Who came to eat?' : 'Who is sharing this?';
-    var sh = sharers({ kind: f.kind, members: f.members, bday: f.bday });
+    var members = f.members.filter(function (m) { return person(m); });
+    var sh = sharers({ kind: f.kind, members: members, bday: f.bday });
     var amt = Number(String(f.amt).replace(/,/g, '')) || 0;
     var each = sh.length ? amt / sh.length : 0;
     var line = sh.length ? 'each, split between ' + sh.length + (sh.length === 1 ? ' person' : ' people') : 'Select who to split with';
@@ -348,7 +529,7 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     h += '<label class="f">' + titleLabel + '<input class="in" type="text" data-k="title" data-bind="title" placeholder="' + esc(titleHint) + '" value="' + esc(f.title) + '"></label>';
     if (f.kind === 'birthday') {
       h += '<label class="f">Whose birthday?<select class="in" data-k="bday" data-bind="bday"><option value="">Pick a person</option>' +
-        S.people.map(function (p) { return '<option value="' + esc(p.id) + '"' + (f.bday === p.id ? ' selected' : '') + '>' + esc(p.name) + '</option>'; }).join('') +
+        D.people.map(function (p) { return '<option value="' + esc(p.id) + '"' + (f.bday === p.id ? ' selected' : '') + '>' + esc(p.name) + '</option>'; }).join('') +
         '</select></label>';
     }
     h += '<label class="f">Total bill (₹)<input class="in big" type="text" inputmode="decimal" data-k="amt" data-bind="amt" placeholder="0" value="' + esc(f.amt) + '"></label>';
@@ -356,8 +537,8 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     h += '</div>';
 
     h += '<div style="display:flex;flex-direction:column;gap:10px"><span style="font-size:14px;font-weight:600">Who paid?</span><div class="chips">';
-    if (!S.people.length) h += '<span class="note">Add people under Team first.</span>';
-    h += S.people.map(function (p) {
+    if (!D.people.length) h += '<span class="note">Add people under Team first.</span>';
+    h += D.people.map(function (p) {
       var on = f.payer === p.id;
       return '<button class="chip' + (on ? ' on' : '') + '" aria-pressed="' + on + '" data-act="payer" data-arg="' + esc(p.id) + '">' + esc(p.name) + '</button>';
     }).join('') + '</div></div>';
@@ -365,8 +546,8 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     h += '<div style="display:flex;flex-direction:column;gap:10px"><div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px">' +
       '<span style="font-size:14px;font-weight:600">' + whoLabel + '</span><div style="display:flex;gap:6px">' +
       '<button class="btn sm" data-act="all">Everyone</button><button class="btn sm" data-act="none">Clear</button></div></div><div class="chips">';
-    h += S.people.map(function (p) {
-      var on = f.members.indexOf(p.id) >= 0;
+    h += D.people.map(function (p) {
+      var on = members.indexOf(p.id) >= 0;
       return '<button class="chip' + (on ? ' on' : '') + '" aria-pressed="' + on + '" data-act="member" data-arg="' + esc(p.id) + '">' + esc(p.name) + '</button>';
     }).join('') + '</div></div>';
 
@@ -376,7 +557,7 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     if (S.error) h += '<p class="err" role="alert">' + esc(S.error) + '</p>';
     h += '</section>';
 
-    // Side: settle + balances
+    // Who owes whom + balances
     h += '<aside class="side"><section class="card" aria-label="Who owes whom" style="gap:8px"><h2>Who owes whom</h2>' +
       '<p class="note">On a phone, the pay button opens Google Pay (or your UPI app) with the name and amount filled in. After paying, tap Mark paid.</p>';
     if (!plan.length) h += '<p class="muted" style="padding-top:6px">Everyone is settled up.</p>';
@@ -385,17 +566,16 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
       var s = '<div class="item settle"><div style="display:flex;flex-direction:column;gap:2px">' +
         '<span><strong>' + esc(name(x.from)) + '</strong> pays <strong>' + esc(name(x.to)) + '</strong></span>' +
         '<span class="mono" style="font-size:18px;color:var(--owe)">' + inr(x.amt) + '</span></div><div style="display:flex;flex-wrap:wrap;gap:8px">';
-      if (ok) s += '<a class="pay" href="' + esc(payUrl(rp, x.amt)) + '">Pay ' + inr(x.amt) + ' on GPay</a>';
+      if (ok) s += '<a class="pay" href="' + esc(payUrl(rp, x.amt)) + '" aria-label="Pay ' + esc(name(x.to)) + ' ' + inr(x.amt) + ' on Google Pay">Pay ' + inr(x.amt) + ' on GPay</a>';
       s += '<button class="btn outline" data-act="mark" data-arg="' + i + '">Mark paid</button></div>';
-      s += ok ? '<span class="small muted">UPI ID: <span class="mono" style="color:var(--ink)">' + esc(rp.upi) + '</span></span>'
-        : '<span class="small muted">Add ' + esc(name(x.to)) + '’s UPI ID under Team to pay from here.</span>';
+      if (!ok) s += '<span class="small muted">' + esc(name(x.to)) + ' isn’t set up for GPay yet. Pay them directly, then tap Mark paid.</span>';
       return s + '</div>';
     }).join('');
     h += '</section>';
 
     h += '<section class="card" aria-label="Balances" style="gap:4px"><h2 style="margin-bottom:8px">Everyone’s balance</h2>';
-    if (!S.people.length) h += '<p class="muted">No one on the team yet.</p>';
-    h += S.people.map(function (p) {
+    if (!D.people.length) h += '<p class="muted">No one on the team yet.</p>';
+    h += D.people.map(function (p) {
       var v = Math.round(L.bal[p.id] || 0);
       var status = v > 0 ? 'Gets back ' + inr(v) : v < 0 ? 'Owes ' + inr(v) : 'Settled up';
       var color = v > 0 ? 'var(--accent)' : v < 0 ? 'var(--owe)' : 'var(--muted)';
@@ -406,8 +586,8 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     h += '</section></aside></div>';
 
     // Bills
-    var rows = S.bills.slice().sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : (a.id < b.id ? 1 : -1); });
-    var billN = S.bills.filter(function (b) { return b.kind !== 'settle'; }).length;
+    var rows = D.bills.slice().sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : (a.id < b.id ? 1 : -1); });
+    var billN = D.bills.filter(function (b) { return b.kind !== 'settle'; }).length;
     h += '<section class="card" aria-label="Bills" style="gap:6px"><div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:12px;padding-bottom:8px">' +
       '<h2>All bills</h2><span class="muted" style="font-size:14px">' + billN + (billN === 1 ? ' bill' : ' bills') + '</span></div>';
     if (!rows.length) h += '<p class="muted" style="padding:10px 0">No bills yet. Add the first one above.</p>';
@@ -420,7 +600,8 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
         if (b.kind === 'birthday' && b.bday) title = b.title + ' for ' + name(b.bday);
         l2 = 'Split: ' + shs.map(name).join(', ') + (b.kind === 'birthday' && b.bday ? ' (birthday: ' + name(b.bday) + ', free)' : '');
       }
-      return '<div class="item bill"><div class="date"><b>' + dt.getDate() + '</b><span>' + dt.toLocaleDateString('en-IN', { month: 'short' }) + '</span></div>' +
+      var day = isNaN(dt) ? '' : dt.getDate(), mon = isNaN(dt) ? '' : dt.toLocaleDateString('en-IN', { month: 'short' });
+      return '<div class="item bill"><div class="date"><b>' + day + '</b><span>' + mon + '</span></div>' +
         '<div class="grow"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:16px;font-weight:600">' + esc(title) + '</span>' +
         '<span class="tag" style="background:' + tg[1] + ';color:' + tg[2] + '">' + tg[0] + '</span></div>' +
         '<span style="font-size:14px;color:var(--soft)">' + esc(l1) + '</span>' + (l2 ? '<span class="small muted">' + esc(l2) + '</span>' : '') + '</div>' +
@@ -430,32 +611,57 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     h += '</section>';
 
     // Team + backup
-    h += '<div class="grid2"><section class="card" aria-label="Team"><h2>Team</h2>' +
-      '<p class="note">Add each person’s UPI ID, the one they use on Google Pay (it looks like name@okaxis). Then others can pay them in one tap.</p><div>';
-    h += S.people.map(function (p) {
-      var bad = !!p.upi && !validUpi(p.upi);
-      return '<div class="item" style="padding:6px 0;display:flex;flex-direction:column;gap:4px"><div class="person"><span class="name">' + esc(p.name) + '</span>' +
-        '<input class="in" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="' + esc(p.name) + '’s UPI ID" placeholder="UPI ID, e.g. name@okaxis" data-k="upi-' + esc(p.id) + '" data-bind="upi" data-arg="' + esc(p.id) + '" value="' + esc(p.upi || '') + '">' +
-        '<button class="icon" aria-label="Remove ' + esc(p.name) + '" data-act="remove" data-arg="' + esc(p.id) + '">' + ICON_X + '</button></div>' +
-        (bad ? '<span class="small" style="color:var(--error)">This doesn’t look like a UPI ID yet. It should look like name@okaxis.</span>' : '') + '</div>';
-    }).join('');
-    h += '</div><div class="addrow">' +
-      '<label class="f">Add a person<input class="in" type="text" placeholder="Name" data-k="newName" data-bind="newName" value="' + esc(S.newName) + '"></label>' +
-      '<label class="f">UPI ID (optional)<input class="in mono" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="name@okaxis" data-k="newUpi" data-bind="newUpi" value="' + esc(S.newUpi) + '"></label>' +
-      '<button class="btn dark" data-act="addPerson">Add</button></div>';
+    var admin = isAdmin();
+    h += '<div class="grid2"><section class="card" aria-label="Team"><div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px"><h2>Team</h2>';
+    if (REMOTE && admin) h += '<button class="btn sm" data-act="lockAdmin">Done editing</button>';
+    if (REMOTE && !admin && !S.adminOpen) h += '<button class="btn sm" data-act="openAdmin">Edit team</button>';
+    h += '</div>';
+
+    if (REMOTE && !admin && S.adminOpen) {
+      h += '<div style="display:flex;flex-direction:column;gap:10px;background:var(--accent-tint);border-radius:12px;padding:14px">' +
+        '<p class="note" style="color:var(--soft)">Only the admin can change names and UPI IDs.</p>' +
+        '<div class="addrow"><label class="f">Admin PIN<input class="in big" type="password" inputmode="numeric" autocomplete="off" data-k="adminPin" data-bind="adminPin" value="' + esc(S.adminDraft) + '"></label>' +
+        '<button class="btn dark" data-act="unlockAdmin">Unlock</button><button class="btn" data-act="closeAdmin">Cancel</button></div>' +
+        (S.adminMsg ? '<p class="err" role="status">' + esc(S.adminMsg) + '</p>' : '') + '</div>';
+    }
+
+    if (!admin) {
+      h += '<div>' + D.people.map(function (p) {
+        var ready = !!p.upi && validUpi(p.upi);
+        return '<div class="bal"><span style="font-weight:500">' + esc(p.name) + '</span>' +
+          '<span class="small" style="color:' + (ready ? '#1F6E4A' : 'var(--muted)') + '">' + (ready ? 'GPay ready' : 'No GPay yet') + '</span></div>';
+      }).join('') + '</div>';
+    } else {
+      h += '<p class="note">Add each person’s UPI ID, the one they use on Google Pay (it looks like name@okaxis). Only you can see these; everyone else just sees a Pay on GPay button.</p><div>';
+      h += D.people.map(function (p) {
+        var v = p.id in S.upiDraft ? S.upiDraft[p.id] : (p.upi || '');
+        var bad = !!v && !validUpi(v.trim());
+        return '<div class="item" style="padding:6px 0;display:flex;flex-direction:column;gap:4px"><div class="person"><span class="name">' + esc(p.name) + '</span>' +
+          '<input class="in" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="' + esc(p.name) + '’s UPI ID" placeholder="UPI ID, e.g. name@okaxis" data-k="upi-' + esc(p.id) + '" data-bind="upi" data-arg="' + esc(p.id) + '" value="' + esc(v) + '">' +
+          '<button class="icon" aria-label="Remove ' + esc(p.name) + '" data-act="remove" data-arg="' + esc(p.id) + '">' + ICON_X + '</button></div>' +
+          (bad ? '<span class="small" style="color:var(--error)">This doesn’t look like a UPI ID yet. It should look like name@okaxis.</span>' : '') + '</div>';
+      }).join('');
+      h += '</div><div class="addrow">' +
+        '<label class="f">Add a person<input class="in" type="text" placeholder="Name" data-k="newName" data-bind="newName" value="' + esc(S.newName) + '"></label>' +
+        '<label class="f">UPI ID (optional)<input class="in mono" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="name@okaxis" data-k="newUpi" data-bind="newUpi" value="' + esc(S.newUpi) + '"></label>' +
+        '<button class="btn dark" data-act="addPerson">Add</button></div>';
+    }
     if (S.teamMsg) h += '<p class="err" role="status">' + esc(S.teamMsg) + '</p>';
     h += '</section>';
 
-    h += '<section class="card" aria-label="Backup"><h2>Backup &amp; share</h2>' +
-      '<p class="note">Bills are saved in this browser only. To pass the sheet to a teammate, copy the backup and send it; they paste it here and press Restore.</p>' +
-      '<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn" style="flex:1 1 auto" data-act="copyBackup">Copy backup</button>' +
-      '<button class="btn" style="flex:1 1 auto" data-act="showBackup">Show backup</button>' +
-      '<button class="btn" style="flex:1 1 auto" data-act="restore">Restore pasted</button></div>' +
-      '<label class="f">Backup text<textarea class="in" rows="4" data-k="backup" data-bind="backup">' + esc(S.backupText) + '</textarea></label>';
-    if (S.backupMsg) h += '<p role="status" style="font-size:14px">' + esc(S.backupMsg) + '</p>';
-    h += '</section></div>';
+    if (admin) {
+      h += '<section class="card" aria-label="Backup"><h2>Backup file</h2>' +
+        '<p class="note">' + (REMOTE
+          ? 'Everything is saved in your team’s Google Sheet. For an extra copy, download a backup file now and then. It includes UPI IDs, so keep it private.'
+          : 'Bills are saved in this browser only. Download a backup file regularly so you never lose them, and open it here to restore.') + '</p>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn" style="flex:1 1 auto" data-act="download">Download backup file</button>' +
+        '<label class="btn filebtn" style="flex:1 1 auto">Restore from file<input type="file" accept=".json,application/json" data-file="restore" aria-label="Restore from a backup file"></label></div>';
+      if (S.backupMsg) h += '<p role="status" style="font-size:14px">' + esc(S.backupMsg) + '</p>';
+      h += '</section>';
+    }
+    h += '</div>';
 
-    h += '<footer>Your data stays on this device. Nothing is sent anywhere.</footer>';
+    h += '<footer>' + (REMOTE ? 'Bills are saved to your team’s Google Sheet.' : 'Your data stays on this device. Nothing is sent anywhere.') + '</footer>';
     return h;
   }
 
@@ -472,6 +678,15 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
   }
 
   render();
+  if (REMOTE) {
+    refresh();
+    setInterval(function () {
+      var typing = document.activeElement && document.activeElement.matches && document.activeElement.matches('input,select,textarea');
+      if (document.visibilityState === 'visible' && !typing) refresh();
+    }, 30000);
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') refresh(); });
+    window.addEventListener('online', function () { flush(); });
+  }
 })();
 </script>
 </body>
