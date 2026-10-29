@@ -37,7 +37,10 @@ p{margin:0}
 .stat b{font-family:var(--mono);font-size:26px;font-weight:500}
 .banner{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;background:#FFF4E5;border:1px solid #F0C48A;border-radius:12px;padding:14px 18px;color:#5C3400}
 .row{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start}
-.main{flex:999 1 560px;min-width:0}
+.main{flex:999 1 560px;min-width:0;display:flex;flex-direction:column;gap:24px}
+.why{display:flex;flex-direction:column;gap:3px;background:#F7F7FA;border-radius:8px;padding:8px 10px}
+.why div{display:flex;justify-content:space-between;gap:12px;font-size:13px;color:var(--soft)}
+.why .mono{white-space:nowrap}
 .side{flex:1 1 360px;min-width:0;display:flex;flex-direction:column;gap:24px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
@@ -115,6 +118,13 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
   function esc(v) {
     return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+  // Reads a stored date safely (handles '2026-10-30' and other formats).
+  function day(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || ''));
+    var d = m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(s);
+    return isNaN(d) ? null : d;
+  }
+  function shortDate(s) { var d = day(s); return d ? d.getDate() + ' ' + d.toLocaleDateString('en-IN', { month: 'short' }) : ''; }
   function inr(n) { return '₹' + Math.round(Math.abs(n)).toLocaleString('en-IN'); }
   function validUpi(u) { return /^[A-Za-z0-9._-]{2,256}@[A-Za-z][A-Za-z0-9]{1,63}$/.test(u || ''); }
   function isAdmin() { return !REMOTE || !!S.admin; }
@@ -302,23 +312,43 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     });
     return { bal: bal, paid: paid, share: share };
   }
-  function settlePlan(bal) {
-    var debt = [], cred = [];
-    Object.keys(bal).forEach(function (k) {
-      var v = Math.round(bal[k]);
-      if (v < 0) debt.push({ id: k, v: -v }); else if (v > 0) cred.push({ id: k, v: v });
-    });
-    debt.sort(function (a, b) { return b.v - a.v; });
-    cred.sort(function (a, b) { return b.v - a.v; });
-    var out = [], i = 0, j = 0;
-    while (i < debt.length && j < cred.length) {
-      var x = Math.min(debt[i].v, cred[j].v);
-      if (x >= 1) out.push({ from: debt[i].id, to: cred[j].id, amt: x });
-      debt[i].v -= x; cred[j].v -= x;
-      if (debt[i].v < 1) i++;
-      if (cred[j].v < 1) j++;
+  // Who owes whom, worked out only between two people who actually shared a bill.
+  // No chaining through third people: if A never shared a bill with B, A never pays B.
+  // Amounts between the same two people are netted, and every line is listed so it's clear why.
+  function pairPlan() {
+    var pairs = {};
+    function owe(debtor, creditor, amt, item) {
+      if (!debtor || !creditor || debtor === creditor || !(amt > 0)) return;
+      var a = debtor < creditor ? debtor : creditor, b = a === debtor ? creditor : debtor, k = a + '|' + b;
+      var p = pairs[k] || (pairs[k] = { a: a, b: b, net: 0, items: [] });
+      p.net += debtor === a ? amt : -amt;   // net > 0 means a owes b
+      item.debtor = debtor; item.creditor = creditor; item.amt = amt;
+      p.items.push(item);
     }
+    D.bills.forEach(function (b) {
+      var amt = Number(b.amt) || 0;
+      if (b.kind === 'settle') { owe(b.to, b.payer, amt, { settle: true, date: b.date }); return; }
+      var sh = sharers(b); if (!sh.length) return;
+      var title = b.kind === 'birthday' && b.bday ? b.title + ' for ' + name(b.bday) : b.title;
+      sh.forEach(function (m) { owe(m, b.payer, amt / sh.length, { title: title, date: b.date }); });
+    });
+    var out = [];
+    Object.keys(pairs).forEach(function (k) {
+      var p = pairs[k];
+      if (Math.abs(p.net) < 1) return;   // settled (leftover paise ignored)
+      var from = p.net > 0 ? p.a : p.b, to = from === p.a ? p.b : p.a;
+      out.push({ from: from, to: to, amt: Math.round(Math.abs(p.net)), items: p.items });
+    });
+    out.sort(function (x, y) { return name(x.from).localeCompare(name(y.from)) || name(x.to).localeCompare(name(y.to)); });
     return out;
+  }
+  function whyLines(x) {
+    return x.items.map(function (it) {
+      var plus = it.debtor === x.from, label;
+      if (it.settle) label = name(it.creditor) + ' paid ' + name(it.debtor) + (it.date ? ', ' + shortDate(it.date) : '');
+      else label = name(it.debtor) + '’s share of ' + it.title + (it.date ? ', ' + shortDate(it.date) : '');
+      return '<div><span>' + esc(label) + '</span><span class="mono">' + (plus ? '+' : '−') + inr(it.amt) + '</span></div>';
+    }).join('');
   }
   function payUrl(p, amt) {
     return 'upi://pay?pa=' + p.upi + '&pn=' + encodeURIComponent(p.name) + '&am=' + Math.round(amt) + '.00&cu=INR&tn=' + encodeURIComponent('Team bill split');
@@ -490,12 +520,51 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
       '<button class="btn sm" data-act="refresh"' + (S.busy ? ' disabled' : '') + '>Refresh</button></div>';
   }
 
+  function sortNewest(list) {
+    return list.slice().sort(function (a, b) {
+      var x = day(a.date), y = day(b.date), dx = x ? x.getTime() : 0, dy = y ? y.getTime() : 0;
+      return dy - dx || (a.id < b.id ? 1 : -1);
+    });
+  }
+  function rowView(b, title, l1, l2) {
+    var d = day(b.date), tg = TAGS[b.kind] || TAGS.other;
+    return '<div class="item bill"><div class="date"><b>' + (d ? d.getDate() : '') + '</b><span>' + (d ? d.toLocaleDateString('en-IN', { month: 'short' }) : '') + '</span></div>' +
+      '<div class="grow"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:16px;font-weight:600">' + esc(title) + '</span>' +
+      '<span class="tag" style="background:' + tg[1] + ';color:' + tg[2] + '">' + tg[0] + '</span></div>' +
+      '<span style="font-size:14px;color:var(--soft)">' + esc(l1) + '</span>' + (l2 ? '<span class="small muted">' + esc(l2) + '</span>' : '') + '</div>' +
+      '<span class="amt">' + inr(b.amt) + '</span>' +
+      '<button class="icon" aria-label="Delete" data-act="del" data-arg="' + esc(b.id) + '">' + ICON_TRASH + '</button></div>';
+  }
+  function sectionHead(t, n, one, many) {
+    return '<div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:12px;padding-bottom:8px">' +
+      '<h2>' + t + '</h2><span class="muted" style="font-size:14px">' + n + ' ' + (n === 1 ? one : many) + '</span></div>';
+  }
+  function billsView() {
+    var rows = sortNewest(D.bills.filter(function (b) { return b.kind !== 'settle'; }));
+    var h = '<section class="card" aria-label="Bills" style="gap:6px">' + sectionHead('Bills', rows.length, 'bill', 'bills');
+    if (!rows.length) h += '<p class="muted" style="padding:10px 0">No bills yet. Add the first one above.</p>';
+    h += rows.map(function (b) {
+      var shs = sharers(b), per = shs.length ? b.amt / shs.length : 0;
+      var title = b.kind === 'birthday' && b.bday ? b.title + ' for ' + name(b.bday) : b.title;
+      var l2 = 'Split: ' + shs.map(name).join(', ') + (b.kind === 'birthday' && b.bday ? ' (birthday: ' + name(b.bday) + ', free)' : '');
+      return rowView(b, title, 'Paid by ' + name(b.payer) + ', ' + inr(per) + ' each', l2);
+    }).join('');
+    return h + '</section>';
+  }
+  function paymentsView() {
+    var rows = sortNewest(D.bills.filter(function (b) { return b.kind === 'settle'; }));
+    var h = '<section class="card" aria-label="Payments" style="gap:6px">' + sectionHead('Payments', rows.length, 'payment', 'payments');
+    if (!rows.length) h += '<p class="muted" style="padding:10px 0">No payments yet. When someone pays, tap Mark paid under Who owes whom.</p>';
+    h += rows.map(function (b) { return rowView(b, name(b.payer) + ' paid ' + name(b.to), 'Marked as paid', ''); }).join('');
+    return h + '</section>';
+  }
+
   function view() {
     D = data();
     var f = S.form, L = ledger();
-    plan = settlePlan(L.bal);
+    plan = pairPlan();
     var total = D.bills.reduce(function (a, b) { return a + (b.kind === 'settle' ? 0 : Number(b.amt) || 0); }, 0);
-    var open = Object.keys(L.bal).reduce(function (a, k) { return a + (L.bal[k] > 0 ? L.bal[k] : 0); }, 0);
+    var open = plan.reduce(function (a, x) { return a + x.amt; }, 0);
     var h = '';
 
     h += '<header class="head"><div style="display:flex;flex-direction:column;gap:6px">' +
@@ -520,7 +589,7 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
     var line = sh.length ? 'each, split between ' + sh.length + (sh.length === 1 ? ' person' : ' people') : 'Select who to split with';
     if (f.kind === 'birthday' && f.bday) line += '. ' + name(f.bday) + ' doesn’t pay.';
 
-    h += '<div class="row"><section class="card main" aria-label="Add a bill"><h2>Add a bill</h2>';
+    h += '<div class="row"><div class="main"><section class="card" aria-label="Add a bill"><h2>Add a bill</h2>';
     h += '<div class="seg">' + kinds.map(function (k) {
       var on = f.kind === k[0];
       return '<button class="' + (on ? 'on' : '') + '" aria-pressed="' + on + '" data-act="kind" data-arg="' + k[0] + '">' + k[1] + '</button>';
@@ -556,16 +625,19 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
       '<button class="btn primary" data-act="addBill">Add bill</button></div>';
     if (S.error) h += '<p class="err" role="alert">' + esc(S.error) + '</p>';
     h += '</section>';
+    h += billsView() + paymentsView();
+    h += '</div>';
 
     // Who owes whom + balances
     h += '<aside class="side"><section class="card" aria-label="Who owes whom" style="gap:8px"><h2>Who owes whom</h2>' +
-      '<p class="note">On a phone, the pay button opens Google Pay (or your UPI app) with the name and amount filled in. After paying, tap Mark paid.</p>';
+      '<p class="note">Only between people who shared a bill. Each line shows the bills behind it. On a phone, the pay button opens Google Pay with the amount filled in; after paying, tap Mark paid.</p>';
     if (!plan.length) h += '<p class="muted" style="padding-top:6px">Everyone is settled up.</p>';
     h += plan.map(function (x, i) {
       var rp = person(x.to) || {}, ok = !!rp.upi && validUpi(rp.upi);
       var s = '<div class="item settle"><div style="display:flex;flex-direction:column;gap:2px">' +
         '<span><strong>' + esc(name(x.from)) + '</strong> pays <strong>' + esc(name(x.to)) + '</strong></span>' +
-        '<span class="mono" style="font-size:18px;color:var(--owe)">' + inr(x.amt) + '</span></div><div style="display:flex;flex-wrap:wrap;gap:8px">';
+        '<span class="mono" style="font-size:18px;color:var(--owe)">' + inr(x.amt) + '</span></div>' +
+        '<div class="why">' + whyLines(x) + '</div><div style="display:flex;flex-wrap:wrap;gap:8px">';
       if (ok) s += '<a class="pay" href="' + esc(payUrl(rp, x.amt)) + '" aria-label="Pay ' + esc(name(x.to)) + ' ' + inr(x.amt) + ' on Google Pay">Pay ' + inr(x.amt) + ' on GPay</a>';
       s += '<button class="btn outline" data-act="mark" data-arg="' + i + '">Mark paid</button></div>';
       if (!ok) s += '<span class="small muted">' + esc(name(x.to)) + ' isn’t set up for GPay yet. Pay them directly, then tap Mark paid.</span>';
@@ -584,31 +656,6 @@ footer{text-align:center;font-size:13px;color:var(--muted)}
         '<span style="font-size:14px;font-weight:600;text-align:right;color:' + color + '">' + status + '</span></div>';
     }).join('');
     h += '</section></aside></div>';
-
-    // Bills
-    var rows = D.bills.slice().sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : (a.id < b.id ? 1 : -1); });
-    var billN = D.bills.filter(function (b) { return b.kind !== 'settle'; }).length;
-    h += '<section class="card" aria-label="Bills" style="gap:6px"><div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:12px;padding-bottom:8px">' +
-      '<h2>All bills</h2><span class="muted" style="font-size:14px">' + billN + (billN === 1 ? ' bill' : ' bills') + '</span></div>';
-    if (!rows.length) h += '<p class="muted" style="padding:10px 0">No bills yet. Add the first one above.</p>';
-    h += rows.map(function (b) {
-      var dt = new Date(b.date + 'T00:00:00'), tg = TAGS[b.kind] || TAGS.other, title = b.title, l1, l2 = '';
-      if (b.kind === 'settle') { title = name(b.payer) + ' paid ' + name(b.to); l1 = 'Marked as settled'; }
-      else {
-        var shs = sharers(b), per = shs.length ? b.amt / shs.length : 0;
-        l1 = 'Paid by ' + name(b.payer) + ', ' + inr(per) + ' each';
-        if (b.kind === 'birthday' && b.bday) title = b.title + ' for ' + name(b.bday);
-        l2 = 'Split: ' + shs.map(name).join(', ') + (b.kind === 'birthday' && b.bday ? ' (birthday: ' + name(b.bday) + ', free)' : '');
-      }
-      var day = isNaN(dt) ? '' : dt.getDate(), mon = isNaN(dt) ? '' : dt.toLocaleDateString('en-IN', { month: 'short' });
-      return '<div class="item bill"><div class="date"><b>' + day + '</b><span>' + mon + '</span></div>' +
-        '<div class="grow"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:16px;font-weight:600">' + esc(title) + '</span>' +
-        '<span class="tag" style="background:' + tg[1] + ';color:' + tg[2] + '">' + tg[0] + '</span></div>' +
-        '<span style="font-size:14px;color:var(--soft)">' + esc(l1) + '</span>' + (l2 ? '<span class="small muted">' + esc(l2) + '</span>' : '') + '</div>' +
-        '<span class="amt">' + inr(b.amt) + '</span>' +
-        '<button class="icon" aria-label="Delete this bill" data-act="del" data-arg="' + esc(b.id) + '">' + ICON_TRASH + '</button></div>';
-    }).join('');
-    h += '</section>';
 
     // Team + backup
     var admin = isAdmin();
